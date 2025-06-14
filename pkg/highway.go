@@ -1,6 +1,7 @@
 package pkg
 
 import (
+	"context"
 	"sync"
 	"time"
 )
@@ -165,6 +166,23 @@ func (s *stream[T, R]) Sink(fn func(T)) error {
 	return nil
 }
 
+func (s *stream[T, R]) Collect(ctx context.Context) ([]T, error) {
+	var result []T
+
+	for {
+		select {
+		case item, ok := <-s.source:
+			if !ok {
+				return result, nil
+			}
+			result = append(result, item)
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+	}
+}
+
 func (s *stream[T, R]) GroupByTimeWindow(timeWindow time.Duration) StreamBatch[T, R] {
 	out := make(chan []T, s.workers)
 
@@ -218,7 +236,7 @@ func (s *stream[T, R]) GroupByTimeWindow(timeWindow time.Duration) StreamBatch[T
 	return &streamBatch[T, R]{source: out, workers: s.workers}
 }
 
-func (s streamBatch[T, R]) Sink(fn func([]T)) error {
+func (s *streamBatch[T, R]) Sink(fn func([]T)) error {
 	if s.workers == 1 {
 		for item := range s.source {
 			fn(item)
@@ -239,4 +257,21 @@ func (s streamBatch[T, R]) Sink(fn func([]T)) error {
 	wg.Wait()
 
 	return nil
+}
+
+func (s *streamBatch[T, R]) Collect(ctx context.Context) ([][]T, error) {
+	var result [][]T
+
+	for {
+		select {
+		case item, ok := <-s.source:
+			if !ok {
+				return result, nil
+			}
+			result = append(result, item)
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+	}
 }

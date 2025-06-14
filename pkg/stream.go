@@ -1,6 +1,9 @@
 package pkg
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 // Stream defines a generic interface for processing streams of data.
 type Stream[T any, R any] interface {
@@ -21,8 +24,15 @@ type Stream[T any, R any] interface {
 
 	// Sink applies the provided function to each element of the stream, typically for side effects
 	Sink(fn func(T)) error
+
+	// Collect gathers all elements of the stream into a slice, returning it
+	Collect(ctx context.Context) ([]T, error)
 }
 
 type StreamBatch[T any, R any] interface {
+	// Sink applies the provided function to each element of the stream, typically for side effects
 	Sink(fn func([]T)) error
+
+	// Collect gathers all elements of the stream into a slice, returning it
+	Collect(ctx context.Context) ([][]T, error)
 }
