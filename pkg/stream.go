@@ -17,8 +17,12 @@ type Stream[T any, R any] interface {
 	Parallel(workers int) Stream[T, R]
 
 	// GroupByTimeWindow stream events into batches based on a fixed time interval, emitting all events collected within each window together.
-	GroupByTimeWindow(timeWindow time.Duration) Stream[[]T, []R]
+	GroupByTimeWindow(timeWindow time.Duration) StreamBatch[T, R]
 
 	// Sink applies the provided function to each element of the stream, typically for side effects
 	Sink(fn func(T)) error
+}
+
+type StreamBatch[T any, R any] interface {
+	Sink(fn func([]T)) error
 }

@@ -10,6 +10,11 @@ type stream[T any, R any] struct {
 	workers int
 }
 
+type streamBatch[T any, R any] struct {
+	source  <-chan []T
+	workers int
+}
+
 func NewSliceStream[T any](data []T) Stream[T, T] {
 	source := make(chan T, len(data))
 	go func() {
@@ -160,7 +165,7 @@ func (s *stream[T, R]) Sink(fn func(T)) error {
 	return nil
 }
 
-func (s *stream[T, R]) GroupByTimeWindow(timeWindow time.Duration) Stream[[]T, []R] {
+func (s *stream[T, R]) GroupByTimeWindow(timeWindow time.Duration) StreamBatch[T, R] {
 	out := make(chan []T, s.workers)
 
 	go func(channel chan<- []T) {
@@ -210,5 +215,28 @@ func (s *stream[T, R]) GroupByTimeWindow(timeWindow time.Duration) Stream[[]T, [
 		}
 	}(out)
 
-	return newStream[[]T, []R](out, s.workers)
+	return &streamBatch[T, R]{source: out, workers: s.workers}
+}
+
+func (s streamBatch[T, R]) Sink(fn func([]T)) error {
+	if s.workers == 1 {
+		for item := range s.source {
+			fn(item)
+		}
+		return nil
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < s.workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for item := range s.source {
+				fn(item)
+			}
+		}()
+	}
+	wg.Wait()
+
+	return nil
 }
