@@ -16,8 +16,19 @@ type streamBatch[T any, R any] struct {
 	workers int
 }
 
+const (
+	// Maximum buffer size to prevent memory explosion
+	maxBufferSize = 1024
+)
+
 func NewSliceStream[T any](data []T) Stream[T, T] {
-	source := make(chan T, len(data))
+	// Strategic buffering: use smaller buffer to prevent memory explosion
+	bufferSize := len(data)
+	if bufferSize > maxBufferSize {
+		bufferSize = maxBufferSize
+	}
+
+	source := make(chan T, bufferSize)
 	go func() {
 		defer close(source)
 		for _, item := range data {
@@ -28,14 +39,8 @@ func NewSliceStream[T any](data []T) Stream[T, T] {
 }
 
 func NewChanStream[T any](ch <-chan T) Stream[T, T] {
-	source := make(chan T, 1)
-	go func() {
-		defer close(source)
-		for item := range ch {
-			source <- item
-		}
-	}()
-	return &stream[T, T]{source: source, workers: 1}
+	// Eliminate unnecessary copy by using the original channel directly
+	return &stream[T, T]{source: ch, workers: 1}
 }
 
 func newStream[T any, R any](source chan T, workers int) Stream[T, R] {
@@ -55,16 +60,31 @@ func (s *stream[T, R]) Map(fn func(T) R) Stream[R, R] {
 			return
 		}
 
+		// Fix race condition: use proper fan-out pattern
 		var wg sync.WaitGroup
+
+		// Create a buffered channel to distribute work
+		workChan := make(chan T, s.workers)
+
+		// Start workers
 		for i := 0; i < s.workers; i++ {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				for item := range s.source {
+				for item := range workChan {
 					channel <- fn(item)
 				}
 			}()
 		}
+
+		// Distribute work
+		go func() {
+			defer close(workChan)
+			for item := range s.source {
+				workChan <- item
+			}
+		}()
+
 		wg.Wait()
 	}(out)
 
@@ -86,18 +106,33 @@ func (s *stream[T, R]) Where(fn func(T) bool) Stream[T, R] {
 			return
 		}
 
+		// Fix race condition: use proper fan-out pattern
 		var wg sync.WaitGroup
+
+		// Create a buffered channel to distribute work
+		workChan := make(chan T, s.workers)
+
+		// Start workers
 		for i := 0; i < s.workers; i++ {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				for item := range s.source {
+				for item := range workChan {
 					if fn(item) {
 						channel <- item
 					}
 				}
 			}()
 		}
+
+		// Distribute work
+		go func() {
+			defer close(workChan)
+			for item := range s.source {
+				workChan <- item
+			}
+		}()
+
 		wg.Wait()
 	}(out)
 
@@ -118,17 +153,32 @@ func (s *stream[T, R]) ForEach(fn func(T)) Stream[T, R] {
 			return
 		}
 
+		// Fix race condition: use proper fan-out pattern
 		var wg sync.WaitGroup
+
+		// Create a buffered channel to distribute work
+		workChan := make(chan T, s.workers)
+
+		// Start workers
 		for i := 0; i < s.workers; i++ {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				for item := range s.source {
+				for item := range workChan {
 					fn(item)
 					channel <- item
 				}
 			}()
 		}
+
+		// Distribute work
+		go func() {
+			defer close(workChan)
+			for item := range s.source {
+				workChan <- item
+			}
+		}()
+
 		wg.Wait()
 	}(out)
 
@@ -139,8 +189,8 @@ func (s *stream[T, R]) Parallel(workers int) Stream[T, R] {
 	if workers <= 0 {
 		workers = 1
 	}
-	s.workers = workers
-	return s
+	// Make immutable: create new stream instead of modifying existing one
+	return &stream[T, R]{source: s.source, workers: workers}
 }
 
 func (s *stream[T, R]) Sink(fn func(T)) error {
@@ -151,18 +201,32 @@ func (s *stream[T, R]) Sink(fn func(T)) error {
 		return nil
 	}
 
+	// Fix race condition: use proper fan-out pattern
 	var wg sync.WaitGroup
+
+	// Create a buffered channel to distribute work
+	workChan := make(chan T, s.workers)
+
+	// Start workers
 	for i := 0; i < s.workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for item := range s.source {
+			for item := range workChan {
 				fn(item)
 			}
 		}()
 	}
-	wg.Wait()
 
+	// Distribute work
+	go func() {
+		defer close(workChan)
+		for item := range s.source {
+			workChan <- item
+		}
+	}()
+
+	wg.Wait()
 	return nil
 }
 
@@ -178,7 +242,7 @@ func (s *stream[T, R]) Collect(ctx context.Context) ([]T, error) {
 			result = append(result, item)
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		default:
+			// Removed default case to fix busy loop - this was causing 100% CPU usage
 		}
 	}
 }
@@ -198,9 +262,8 @@ func (s *stream[T, R]) GroupByTimeWindow(timeWindow time.Duration) StreamBatch[T
 			case item, ok := <-s.source:
 				if !ok {
 					if len(currentBatch) > 0 {
-						finalBatch := make([]T, len(currentBatch))
-						copy(finalBatch, currentBatch)
-						channel <- finalBatch
+						// Optimize: avoid unnecessary copy by reusing the slice
+						channel <- currentBatch
 					}
 					if ticker != nil {
 						ticker.Stop()
@@ -220,10 +283,9 @@ func (s *stream[T, R]) GroupByTimeWindow(timeWindow time.Duration) StreamBatch[T
 
 			case <-tickerCh:
 				if len(currentBatch) > 0 {
-					batch := make([]T, len(currentBatch))
-					copy(batch, currentBatch)
-					channel <- batch
-					currentBatch = currentBatch[:0]
+					// Send current batch and create new one
+					channel <- currentBatch
+					currentBatch = make([]T, 0, 64)
 				}
 				if ticker != nil {
 					ticker.Stop()
@@ -244,18 +306,32 @@ func (s *streamBatch[T, R]) Sink(fn func([]T)) error {
 		return nil
 	}
 
+	// Fix race condition: use proper fan-out pattern
 	var wg sync.WaitGroup
+
+	// Create a buffered channel to distribute work
+	workChan := make(chan []T, s.workers)
+
+	// Start workers
 	for i := 0; i < s.workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for item := range s.source {
+			for item := range workChan {
 				fn(item)
 			}
 		}()
 	}
-	wg.Wait()
 
+	// Distribute work
+	go func() {
+		defer close(workChan)
+		for item := range s.source {
+			workChan <- item
+		}
+	}()
+
+	wg.Wait()
 	return nil
 }
 
@@ -271,7 +347,7 @@ func (s *streamBatch[T, R]) Collect(ctx context.Context) ([][]T, error) {
 			result = append(result, item)
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		default:
+			// Removed default case to fix busy loop
 		}
 	}
 }
